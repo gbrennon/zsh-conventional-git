@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# scripts/coverage-summary
+# Read a kcov coverage directory and print a terminal-friendly summary.
+#
+# Usage:  coverage-summary <coverage-dir> [source-file...]
+#
+# If source files are provided, any file NOT found in the kcov report
+# is shown at 0 % coverage so the report is always complete.
+
+set -euo pipefail
+
+COVDIR="${1:-}"
+shift || true
+
+# Last argument is the project root if more than just source files given.
+if [[ $# -gt 0 ]]; then
+  PROJ_ROOT="${@: -1}"
+  set -- "${@:1:$#-1}"
+else
+  PROJ_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+fi
+EXPECTED_FILES=("$@")
+
+if [[ -z "$COVDIR" || ! -d "$COVDIR" ]]; then
+  echo "Usage: coverage-summary <coverage-dir> [source-file...] [project-root]" >&2
+  exit 1
+fi
+
+JSON=$(find "$COVDIR" -name coverage.json -print -quit 2>/dev/null || true)
+if [[ -z "$JSON" ]]; then
+  echo "Error: no coverage.json found in $COVDIR" >&2
+  exit 1
+fi
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+# Build a string of N copies of a character (pure bash, no tr/sed).
+repeat() {
+  local n=$1 char=$2 out=""
+  local i
+  for ((i = 0; i < n; i++)); do out+="$char"; done
+  printf '%s' "$out"
+}
+
+bar() {
+  local pct="${1%.*}"
+  local w=20
+  local filled=$(( pct * w / 100 ))
+  local empty=$(( w - filled ))
+  local colour
+  if   (( pct >= 75 )); then colour='\033[32m'   # green
+  elif (( pct >= 50 )); then colour='\033[33m'   # yellow
+  else                      colour='\033[31m'   # red
+  fi
+  printf '%b' "$colour"
+  repeat "$filled" '█'
+  printf '\033[0m'
+  repeat "$empty"   '░'
+}
+
+pct() { printf '%6s' "${1}%"; }
+
+# ── parse kcov JSON ──────────────────────────────────────────────────────────
+
+read -r -d '' PYSCRIPT <<'PYEOF' || true
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+for f in data.get("files", []):
+    print(f"{f['file']}|{f['percent_covered']}|{f['covered_lines']}|{f['total_lines']}")
+PYEOF
+
+declare -A COV_PCT COV_COV COV_TOT
+while IFS='|' read -r file pct_covered covered total; do
+  [[ -z "$file" ]] && continue
+  # Strip the project root prefix to get a relative path.
+  local_path="${file#$PROJ_ROOT/}"
+  COV_PCT["$local_path"]="$pct_covered"
+  COV_COV["$local_path"]="$covered"
+  COV_TOT["$local_path"]="$total"
+done < <(python3 -c "$PYSCRIPT" "$JSON")
+
+# If kcov tracked nothing, print a diagnostic and exit early.
+if [[ ${#COV_PCT[@]} -eq 0 ]]; then
+  echo "  Warning: kcov tracked 0 source files." >&2
+  echo "  Coverage JSON: $JSON" >&2
+  echo "  Project root:  $PROJ_ROOT" >&2
+  echo "  Run 'python3 -m json.tool $JSON' to inspect." >&2
+  echo "" >&2
+fi
+
+# ── build display list ──────────────────────────────────────────────────────
+
+declare -a DISPLAY_FILES=()
+
+if [[ ${#EXPECTED_FILES[@]} -gt 0 ]]; then
+  for f in "${EXPECTED_FILES[@]}"; do
+    DISPLAY_FILES+=("$f")
+  done
+else
+  for f in "${!COV_PCT[@]}"; do
+    DISPLAY_FILES+=("$f")
+  done
+fi
+
+# ── render table ─────────────────────────────────────────────────────────────
+
+TOTAL_COVERED=0
+TOTAL_LINES=0
+
+echo ""
+printf '  %-55s %6s  %s\n' "File" "Cover" "       Lines"
+printf '  %-55s %6s  %s\n' \
+  "$(repeat 55 '─')" \
+  "$(repeat  6 '─')" \
+  "$(repeat 18 '─')"
+
+for path in "${DISPLAY_FILES[@]}"; do
+  pct_cov="${COV_PCT[$path]:-0.00}"
+  cov="${COV_COV[$path]:-0}"
+  tot="${COV_TOT[$path]:-0}"
+
+  TOTAL_COVERED=$(( TOTAL_COVERED + cov ))
+  TOTAL_LINES=$(( TOTAL_LINES + tot ))
+
+  printf '  %-55s ' "$path"
+  bar "$pct_cov"
+  printf ' '
+  pct "$pct_cov"
+  printf '  %4s / %-4s lines\n' "$cov" "$tot"
+done
+
+# ── aggregate row ────────────────────────────────────────────────────────────
+
+if (( TOTAL_LINES > 0 )); then
+  TOTAL_PCT=$(python3 -c "print(round($TOTAL_COVERED * 100.0 / $TOTAL_LINES, 2))")
+else
+  TOTAL_PCT="0.00"
+fi
+
+printf '  %-55s ' "$(repeat 55 '─')"
+printf '%s '     "$(repeat 20 '─')"
+printf '%6s  '   "$(repeat  6 '─')"
+printf '%s\n'    "$(repeat 18 '─')"
+
+printf '  %-55s ' "TOTAL"
+bar "$TOTAL_PCT"
+printf ' '
+pct "$TOTAL_PCT"
+printf '  %4s / %-4s lines\n' "$TOTAL_COVERED" "$TOTAL_LINES"
+echo ""
+
